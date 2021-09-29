@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"strconv"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -1149,24 +1148,25 @@ func testBinaryOp(val string) BinTestOperator {
 }
 
 // Quote returns a quoted version of the input string,
-// so that the quoted version is always expanded or interpreted
-// as the original string.
+// so that the quoted version is expanded or interpreted
+// as the original string in the given language variant.
 //
 // When the boolean result is false,
 // the input string cannot be quoted to satisfy the rule above.
-// For example, an expanded shell string can't contain a null byte.
+// For instance, POSIX lacks escape sequences for non-printable characters,
+// and no language variant can represent a string containing null bytes.
 //
 // Quoting is necessary when using arbitrary literal strings
 // as words in a shell script or command.
-// Without quoting, one could run into syntax errors,
+// Without quoting, one can run into syntax errors,
 // as well as the possibility of running unintended code.
 //
 // The quoting strategy is chosen on a best-effort basis,
 // to minimize the amount of extra bytes necessary.
 //
 // Some strings do not require any quoting and are returned unchanged.
-// Those strings can be directly surrounded in single quotes.
-func Quote(s string) (_ string, ok bool) {
+// Those strings can be directly surrounded in single quotes as well.
+func Quote(s string, lang LangVariant) (_ string, ok bool) {
 	shellChars := false
 	nonPrintable := false
 	for _, r := range s {
@@ -1193,6 +1193,11 @@ func Quote(s string) (_ string, ok bool) {
 			return "", false
 		}
 		if r == utf8.RuneError || !unicode.IsPrint(r) {
+			if lang == LangPOSIX {
+				// POSIX shell lacks $'.
+				// Without it, we can't use escape sequences such as \x.
+				return "", false
+			}
 			nonPrintable = true
 		}
 	}
@@ -1209,24 +1214,58 @@ func Quote(s string) (_ string, ok bool) {
 	var b strings.Builder
 	if nonPrintable {
 		b.WriteString("$'")
-		quoteBuf := make([]byte, 0, 16)
+		lastRequoteIfHex := false
 		for rem := s; len(rem) > 0; {
+			nextRequoteIfHex := false
 			r, size := utf8.DecodeRuneInString(rem)
 			switch {
-			case r == utf8.RuneError && size == 1:
-				fmt.Fprintf(&b, "\\x%x", rem[0])
-			case !unicode.IsPrint(r):
-				quoteBuf = quoteBuf[:0]
-				quoteBuf = strconv.AppendQuoteRuneToASCII(quoteBuf, r)
-				// We don't want the single quotes from strconv.
-				b.Write(quoteBuf[1 : len(quoteBuf)-1])
 			case r == '\'', r == '\\':
 				b.WriteByte('\\')
 				b.WriteRune(r)
-			default:
+			case unicode.IsPrint(r) && r != utf8.RuneError:
+				if lastRequoteIfHex && isHex(r) {
+					b.WriteString("'$'")
+				}
 				b.WriteRune(r)
+			case r == '\a':
+				b.WriteString(`\a`)
+			case r == '\b':
+				b.WriteString(`\b`)
+			case r == '\f':
+				b.WriteString(`\f`)
+			case r == '\n':
+				b.WriteString(`\n`)
+			case r == '\r':
+				b.WriteString(`\r`)
+			case r == '\t':
+				b.WriteString(`\t`)
+			case r == '\v':
+				b.WriteString(`\v`)
+			case r < utf8.RuneSelf, r == utf8.RuneError && size == 1:
+				// \xXX, fixed at two hexadecimal characters.
+				fmt.Fprintf(&b, "\\x%02x", rem[0])
+				// Unfortunately, mksh allows \x to consume more hex characters.
+				// Ensure that we don't allow it to read more than two.
+				if lang == LangMirBSDKorn {
+					nextRequoteIfHex = true
+				}
+			case r > utf8.MaxRune:
+				// Not a valid Unicode code point?
+				return "", false
+			case r < 0x10000:
+				// \uXXXX, fixed at four hexadecimal characters.
+				fmt.Fprintf(&b, "\\u%04x", r)
+			default:
+				// \UXXXXXXXX, fixed at eight hexadecimal characters.
+				if lang == LangMirBSDKorn {
+					// mksh seems to lack support for codepoints above 16 bits?
+					// See the CAVEATS section in R59.
+					return "", false
+				}
+				fmt.Fprintf(&b, "\\U%08x", r)
 			}
 			rem = rem[size:]
+			lastRequoteIfHex = nextRequoteIfHex
 		}
 		b.WriteString("'")
 		return b.String(), true
@@ -1249,4 +1288,10 @@ func Quote(s string) (_ string, ok bool) {
 	}
 	b.WriteByte('"')
 	return b.String(), true
+}
+
+func isHex(r rune) bool {
+	return (r >= '0' && r <= '9') ||
+		(r >= 'a' && r <= 'f') ||
+		(r >= 'A' && r <= 'F')
 }

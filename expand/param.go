@@ -264,9 +264,10 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 			switch arg {
 			case "Q":
 				var ok bool
-				str, ok = syntax.Quote(str)
+				str, ok = syntax.Quote(str, syntax.LangBash)
 				if !ok {
-					// Variables can't contain null bytes.
+					// Is this even possible? If a user runs into this panic,
+					// it's most likely a bug we need to fix.
 					panic("syntax.Quote should never fail on a variable")
 				}
 			case "E":
